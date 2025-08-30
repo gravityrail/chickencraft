@@ -860,44 +860,59 @@ class SimpleGame {
         const numFronds = 5 + Math.floor(Math.random() * 2); // 5-6 fronds
         const trunkTopY = y + 6; // Top of trunk
         
-        // Simple connected palm fronds
+        // Create properly connected palm fronds
         for (let j = 0; j < numFronds; j++) {
           const frondAngle = (j / numFronds) * Math.PI * 2;
           
-          // Create connected frond segments from trunk top
-          for (let segment = 0; segment < 3; segment++) {
-            const segmentStart = segment * 0.8;
-            const segmentEnd = (segment + 1) * 0.8;
-            const segmentLength = 0.9;
-            const segmentWidth = 0.5 - segment * 0.15;
+          // Create a single continuous frond using connected segments
+          const totalLength = 2.5; // Total frond length
+          const numSegments = 4;
+          
+          let prevEndX = x; // Start from trunk center
+          let prevEndZ = z;
+          let prevEndY = trunkTopY; // Start from trunk top
+          
+          for (let segment = 0; segment < numSegments; segment++) {
+            const segmentLength = totalLength / numSegments;
+            const segmentWidth = 0.6 - segment * 0.12; // Taper width
             
-            // Calculate segment position - all originate from trunk top
-            const startX = x + Math.cos(frondAngle) * segmentStart;
-            const startZ = z + Math.sin(frondAngle) * segmentStart;
-            const startY = trunkTopY - segment * 0.3;
+            // Calculate the end position of this segment
+            const segmentDistance = (segment + 1) * segmentLength;
+            const droop = segment * 0.5; // Increasing droop per segment
             
-            const endX = x + Math.cos(frondAngle) * segmentEnd;
-            const endZ = z + Math.sin(frondAngle) * segmentEnd;
-            const endY = trunkTopY - (segment + 1) * 0.4;
+            const endX = x + Math.cos(frondAngle) * segmentDistance;
+            const endZ = z + Math.sin(frondAngle) * segmentDistance;
+            const endY = trunkTopY - droop;
             
+            // Create segment mesh
             const frond = MeshBuilder.CreateBox(`palmFrond_${i}_${j}_${segment}`, {
               width: segmentWidth,
-              height: 0.04,
-              depth: segmentLength
+              height: 0.05,
+              depth: segmentLength * 1.1 // Slight overlap to connect segments
             }, this.scene);
             
-            // Position at midpoint
+            // Position at midpoint between previous end and current end
             frond.position = new Vector3(
-              (startX + endX) / 2,
-              (startY + endY) / 2,
-              (startZ + endZ) / 2
+              (prevEndX + endX) / 2,
+              (prevEndY + endY) / 2,
+              (prevEndZ + endZ) / 2
             );
             
-            // Rotate to follow frond direction and droop
-            frond.rotation.y = frondAngle;
-            frond.rotation.x = Math.PI / 8 + segment * Math.PI / 12;
+            // Calculate rotation to align with segment direction
+            const dx = endX - prevEndX;
+            const dy = endY - prevEndY;
+            const dz = endZ - prevEndZ;
+            
+            frond.rotation.y = Math.atan2(dx, dz);
+            frond.rotation.x = Math.atan2(-dy, Math.sqrt(dx * dx + dz * dz));
+            frond.rotation.z = Math.sin(segment * 0.5) * 0.1; // Slight twist
             
             frond.material = leafMat;
+            
+            // Update previous end position for next segment
+            prevEndX = endX;
+            prevEndZ = endZ;
+            prevEndY = endY;
           }
         }
       }
