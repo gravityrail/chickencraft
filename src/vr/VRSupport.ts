@@ -98,12 +98,16 @@ export class VRSupport {
       // Disable teleportation
       featureManager.disableFeature(WebXRFeatureName.TELEPORTATION);
       
-      // Enable movement (smooth locomotion)
-      featureManager.enableFeature(WebXRFeatureName.MOVEMENT, 'latest', {
+      // Disable teleportation and movement features - we'll handle movement manually
+      // This prevents the flying issue
+      
+      // Setup manual movement in the update loop
+      this.setupManualMovement();
+      
+      // Enable pointer selection for UI interaction
+      featureManager.enableFeature(WebXRFeatureName.POINTER_SELECTION, 'stable', {
         xrInput: this.xrHelper.input,
-        movementOrientationFollowsViewerPose: true,
-        movementSpeed: 0.5,
-        rotationSpeed: 0.25
+        enablePointerSelectionOnAllControllers: true
       });
       
       // Enable hand tracking (optional, for Quest)
@@ -128,12 +132,22 @@ export class VRSupport {
   private setupControllerInput(): void {
     if (!this.xrHelper) return;
     
+    // Track which controllers we've already set up
+    const setupControllers = new Set<string>();
+    
     // Add controller input handling
     this.xrHelper.input.onControllerAddedObservable.add((controller) => {
+      // Check if we've already set up this controller
+      const controllerId = controller.inputSource.handedness + '_' + controller.inputSource.targetRayMode;
+      if (setupControllers.has(controllerId)) {
+        return;
+      }
+      setupControllers.add(controllerId);
+      
       console.log('Controller added:', controller.inputSource.handedness);
       
-      // Setup trigger for mining (primary action)
-      controller.onMotionControllerInitObservable.add((motionController) => {
+      // Setup trigger for mining (primary action) - use addOnce to prevent duplicates
+      controller.onMotionControllerInitObservable.addOnce((motionController) => {
         const triggerComponent = motionController.getComponent('xr-standard-trigger');
         
         if (triggerComponent) {
@@ -252,6 +266,10 @@ export class VRSupport {
       
       if (scale < 0.1) {
         clearInterval(animation);
+        // Properly dispose of material and mesh
+        if (sphere.material) {
+          sphere.material.dispose();
+        }
         sphere.dispose();
       }
     }, 50);
@@ -324,6 +342,93 @@ export class VRSupport {
   
   public get isCurrentlyInVR(): boolean {
     return this.isInVR;
+  }
+  
+  private setupManualMovement(): void {
+    if (!this.xrHelper) return;
+    
+    // Track thumbstick values for movement
+    let leftStickX = 0;
+    let leftStickY = 0;
+    let rightStickX = 0;
+    let rightStickY = 0;
+    
+    // Track ground height
+    let groundHeight = 0;
+    
+    this.xrHelper.input.onControllerAddedObservable.add((controller) => {
+      controller.onMotionControllerInitObservable.add((motionController) => {
+        const thumbstick = motionController.getComponent('xr-standard-thumbstick');
+        
+        if (thumbstick) {
+          thumbstick.onAxisValueChangedObservable.add((axes) => {
+            if (controller.inputSource.handedness === 'left') {
+              leftStickX = axes.x;
+              leftStickY = axes.y;
+            } else if (controller.inputSource.handedness === 'right') {
+              rightStickX = axes.x;
+              rightStickY = axes.y;
+            }
+          });
+        }
+      });
+    });
+    
+    // Update movement in render loop
+    this.scene.registerBeforeRender(() => {
+      if (!this.xrHelper?.baseExperience?.camera) return;
+      
+      const camera = this.xrHelper.baseExperience.camera;
+      const dt = this.scene.getEngine().getDeltaTime() / 1000;
+      
+      // Get forward direction from camera rotation
+      // Note: In VR, we need to use negative Z for forward (Babylon convention)
+      const forward = new Vector3(
+        Math.sin(camera.rotation.y),
+        0,
+        Math.cos(camera.rotation.y)
+      );
+      
+      // Get right direction
+      const right = new Vector3(
+        Math.cos(camera.rotation.y),
+        0,
+        -Math.sin(camera.rotation.y)
+      );
+      
+      // Apply movement based on right thumbstick
+      // Note: Negate Y input because thumbstick up is negative
+      const moveSpeed = 4; // meters per second
+      const movement = forward.scale(-rightStickY * moveSpeed * dt)
+        .add(right.scale(rightStickX * moveSpeed * dt));
+      
+      // Apply rotation based on left thumbstick
+      const rotSpeed = 1.5; // radians per second
+      camera.rotation.y += leftStickX * rotSpeed * dt;
+      
+      // Apply movement to camera position
+      camera.position.addInPlace(movement);
+      
+      // Cast ray down from camera to find ground
+      const rayOrigin = camera.position.clone();
+      rayOrigin.y += 10; // Start from above
+      const ray = new Ray(rayOrigin, Vector3.Down(), 20);
+      const pickInfo = this.scene.pickWithRay(ray, (mesh) => {
+        // Only pick solid blocks, not entities or UI
+        return mesh.name.startsWith('chunk_') || mesh.name === 'ground';
+      });
+      
+      if (pickInfo && pickInfo.hit && pickInfo.pickedPoint) {
+        // Place camera 1.6 blocks above the ground (player height)
+        groundHeight = pickInfo.pickedPoint.y + 1.6;
+        
+        // Smoothly adjust to ground height
+        const heightDiff = groundHeight - camera.position.y;
+        if (Math.abs(heightDiff) > 0.01) {
+          camera.position.y += heightDiff * 0.1; // Smooth transition
+        }
+      }
+    });
   }
   
   public dispose(): void {

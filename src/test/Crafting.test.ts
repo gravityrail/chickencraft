@@ -1,81 +1,97 @@
-import { describe, it, expect } from 'vitest';
-import { CraftingSystem, ItemId } from '../game/Crafting';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { CraftingSystem, ToolType, Material } from '../crafting/CraftingSystem';
 import { BlockId } from '../world/Block';
-import { Inventory } from '../game/Inventory';
 
 describe('CraftingSystem', () => {
-  describe('findRecipe', () => {
-    it('should find stick recipe', () => {
-      const grid = [
-        [BlockId.WOOD, null, null],
-        [BlockId.WOOD, null, null],
-        [null, null, null]
-      ];
-      
-      const recipe = CraftingSystem.findRecipe(grid);
-      expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.STICK);
-      expect(recipe?.output.count).toBe(4);
-    });
-    
-    it('should find crafting table recipe', () => {
-      const grid = [
-        [BlockId.WOOD, BlockId.WOOD, null],
-        [BlockId.WOOD, BlockId.WOOD, null],
-        [null, null, null]
-      ];
-      
-      const recipe = CraftingSystem.findRecipe(grid);
-      expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(BlockId.CRAFTING_TABLE);
-    });
-    
+  let craftingSystem: CraftingSystem;
+  
+  beforeEach(() => {
+    craftingSystem = new CraftingSystem();
+  });
+  
+  describe('checkRecipe', () => {
     it('should find wooden pickaxe recipe', () => {
       const grid = [
         [BlockId.WOOD, BlockId.WOOD, BlockId.WOOD],
-        [null, ItemId.STICK, null],
-        [null, ItemId.STICK, null]
+        [null, BlockId.WOOD, null],
+        [null, BlockId.WOOD, null]
       ];
       
-      const recipe = CraftingSystem.findRecipe(grid);
+      const recipe = craftingSystem.checkRecipe(grid);
       expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.WOODEN_PICKAXE);
+      expect(recipe?.output.type).toBe('tool');
+      expect(recipe?.output.toolType).toBe(ToolType.PICKAXE);
+      expect(recipe?.output.material).toBe(Material.WOOD);
+    });
+    
+    it('should find brick pickaxe recipe', () => {
+      const grid = [
+        [BlockId.BRICK, BlockId.BRICK, BlockId.BRICK],
+        [null, BlockId.WOOD, null],
+        [null, BlockId.WOOD, null]
+      ];
+      
+      const recipe = craftingSystem.checkRecipe(grid);
+      expect(recipe).toBeDefined();
+      expect(recipe?.output.type).toBe('tool');
+      expect(recipe?.output.toolType).toBe(ToolType.PICKAXE);
+      expect(recipe?.output.material).toBe(Material.BRICK);
     });
     
     it('should find wooden axe recipe', () => {
       const grid = [
         [BlockId.WOOD, BlockId.WOOD, null],
-        [BlockId.WOOD, ItemId.STICK, null],
-        [null, ItemId.STICK, null]
+        [BlockId.WOOD, BlockId.WOOD, null],
+        [null, BlockId.WOOD, null]
       ];
       
-      const recipe = CraftingSystem.findRecipe(grid);
+      const recipe = craftingSystem.checkRecipe(grid);
       expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.WOODEN_AXE);
+      expect(recipe?.output.type).toBe('tool');
+      expect(recipe?.output.toolType).toBe(ToolType.AXE);
+      expect(recipe?.output.material).toBe(Material.WOOD);
+    });
+    
+    it('should find brick axe recipe', () => {
+      const grid = [
+        [BlockId.BRICK, BlockId.BRICK, null],
+        [BlockId.BRICK, BlockId.WOOD, null],
+        [null, BlockId.WOOD, null]
+      ];
+      
+      const recipe = craftingSystem.checkRecipe(grid);
+      expect(recipe).toBeDefined();
+      expect(recipe?.output.type).toBe('tool');
+      expect(recipe?.output.toolType).toBe(ToolType.AXE);
+      expect(recipe?.output.material).toBe(Material.BRICK);
     });
     
     it('should find wooden sword recipe', () => {
       const grid = [
         [BlockId.WOOD, null, null],
         [BlockId.WOOD, null, null],
-        [ItemId.STICK, null, null]
+        [BlockId.WOOD, null, null]
       ];
       
-      const recipe = CraftingSystem.findRecipe(grid);
+      const recipe = craftingSystem.checkRecipe(grid);
       expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.WOODEN_SWORD);
+      expect(recipe?.output.type).toBe('tool');
+      expect(recipe?.output.toolType).toBe(ToolType.SWORD);
+      expect(recipe?.output.material).toBe(Material.WOOD);
     });
     
-    it('should find brick pickaxe recipe', () => {
+    it('should find brick sword recipe', () => {
       const grid = [
-        [BlockId.BRICK, BlockId.BRICK, BlockId.BRICK],
-        [null, ItemId.STICK, null],
-        [null, ItemId.STICK, null]
+        [BlockId.BRICK, null, null],
+        [BlockId.BRICK, null, null],
+        [BlockId.WOOD, null, null]
       ];
       
-      const recipe = CraftingSystem.findRecipe(grid);
+      const recipe = craftingSystem.checkRecipe(grid);
       expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.BRICK_PICKAXE);
+      expect(recipe?.output.type).toBe('tool');
+      expect(recipe?.output.toolType).toBe(ToolType.SWORD);
+      expect(recipe?.output.material).toBe(Material.BRICK);
     });
     
     it('should return null for invalid recipe', () => {
@@ -85,107 +101,61 @@ describe('CraftingSystem', () => {
         [null, null, null]
       ];
       
-      const recipe = CraftingSystem.findRecipe(grid);
+      const recipe = craftingSystem.checkRecipe(grid);
       expect(recipe).toBeNull();
     });
     
-    it('should match recipe at any position in grid', () => {
+    it('should match exact pattern only', () => {
+      // Different position than expected - should not match
       const grid = [
         [null, null, null],
         [null, BlockId.WOOD, null],
         [null, BlockId.WOOD, null]
       ];
       
-      const recipe = CraftingSystem.findRecipe(grid);
-      expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.STICK);
+      const recipe = craftingSystem.checkRecipe(grid);
+      expect(recipe).toBeNull();
     });
   });
   
-  describe('craft', () => {
-    it('should craft item when ingredients are available', () => {
-      const inventory = new Inventory(36);
-      inventory.addItem(BlockId.WOOD, 10);
+  describe('createTool', () => {
+    it('should create wooden pickaxe with correct properties', () => {
+      const tool = craftingSystem.createTool(ToolType.PICKAXE, Material.WOOD);
       
-      const grid = [
-        [BlockId.WOOD, null, null],
-        [BlockId.WOOD, null, null],
-        [null, null, null]
-      ];
-      
-      const result = CraftingSystem.craft(grid, inventory);
-      expect(result).toBeDefined();
-      expect(result?.itemId).toBe(ItemId.STICK);
-      expect(result?.count).toBe(4);
+      expect(tool.type).toBe(ToolType.PICKAXE);
+      expect(tool.material).toBe(Material.WOOD);
+      expect(tool.durability).toBe(60);
+      expect(tool.maxDurability).toBe(60);
+      expect(tool.multipliers.get(BlockId.BRICK)).toBe(5);
+      expect(tool.multipliers.get(BlockId.WOOD)).toBe(2);
     });
     
-    it('should return null when ingredients are insufficient', () => {
-      const inventory = new Inventory(36);
-      inventory.addItem(BlockId.WOOD, 1);
+    it('should create brick axe with correct properties', () => {
+      const tool = craftingSystem.createTool(ToolType.AXE, Material.BRICK);
       
-      const grid = [
-        [BlockId.WOOD, BlockId.WOOD, null],
-        [BlockId.WOOD, BlockId.WOOD, null],
-        [null, null, null]
-      ];
-      
-      const result = CraftingSystem.craft(grid, inventory);
-      expect(result).toBeNull();
-    });
-  });
-  
-  describe('consumeIngredients', () => {
-    it('should remove ingredients from inventory', () => {
-      const inventory = new Inventory(36);
-      inventory.addItem(BlockId.WOOD, 10);
-      
-      const grid = [
-        [BlockId.WOOD, null, null],
-        [BlockId.WOOD, null, null],
-        [null, null, null]
-      ];
-      
-      CraftingSystem.consumeIngredients(grid, inventory);
-      expect(inventory.countItem(BlockId.WOOD)).toBe(8);
-    });
-  });
-  
-  describe('getItemName', () => {
-    it('should return correct item names', () => {
-      expect(CraftingSystem.getItemName(ItemId.STICK)).toBe('Stick');
-      expect(CraftingSystem.getItemName(ItemId.WOODEN_PICKAXE)).toBe('Wooden Pickaxe');
-      expect(CraftingSystem.getItemName(ItemId.BRICK_AXE)).toBe('Brick Axe');
-      expect(CraftingSystem.getItemName(ItemId.CHICKEN_SWORD)).toBe('Chicken Sword');
+      expect(tool.type).toBe(ToolType.AXE);
+      expect(tool.material).toBe(Material.BRICK);
+      expect(tool.durability).toBe(180);
+      expect(tool.maxDurability).toBe(180);
+      expect(tool.multipliers.get(BlockId.WOOD)).toBe(5);
     });
     
-    it('should return Unknown Item for invalid IDs', () => {
-      expect(CraftingSystem.getItemName(999)).toBe('Unknown Item');
-    });
-  });
-  
-  describe('chicken recipes', () => {
-    it('should find chicken pickaxe recipe', () => {
-      const grid = [
-        [BlockId.CHICKENHEAD, BlockId.CHICKENHEAD, BlockId.CHICKENHEAD],
-        [null, ItemId.STICK, null],
-        [null, ItemId.STICK, null]
-      ];
+    it('should create fist with default durability', () => {
+      const tool = craftingSystem.createTool(ToolType.FIST);
       
-      const recipe = CraftingSystem.findRecipe(grid);
-      expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.CHICKEN_PICKAXE);
+      expect(tool.type).toBe(ToolType.FIST);
+      expect(tool.material).toBeUndefined();
+      expect(tool.durability).toBe(100);
+      expect(tool.maxDurability).toBe(100);
+      expect(tool.multipliers.size).toBe(0);
     });
     
-    it('should find chicken wand recipe with surprises enabled', () => {
-      const grid = [
-        [BlockId.CHICKENHEAD, null, null],
-        [ItemId.STICK, null, null],
-        [ItemId.STICK, null, null]
-      ];
+    it('should create sword with correct multipliers', () => {
+      const tool = craftingSystem.createTool(ToolType.SWORD, Material.WOOD);
       
-      const recipe = CraftingSystem.findRecipe(grid);
-      expect(recipe).toBeDefined();
-      expect(recipe?.output.itemId).toBe(ItemId.CHICKEN_WAND);
+      expect(tool.type).toBe(ToolType.SWORD);
+      expect(tool.multipliers.get(BlockId.GRASS)).toBe(1.5);
+      expect(tool.multipliers.get(BlockId.WOOD)).toBe(1.2);
     });
   });
 });

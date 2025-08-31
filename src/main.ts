@@ -1,7 +1,7 @@
 import { 
   Engine, Scene, HemisphericLight, Vector3, UniversalCamera, 
   Color3, StandardMaterial, MeshBuilder, Mesh, Ray, DynamicTexture,
-  Texture
+  Texture, MultiMaterial, SubMesh, Vector4
 } from '@babylonjs/core';
 import { 
   AdvancedDynamicTexture, StackPanel, Button, TextBlock, Slider, 
@@ -11,6 +11,29 @@ import { createNoise2D } from 'simplex-noise';
 import { Chunk, CHUNK_WIDTH, CHUNK_HEIGHT, CHUNK_DEPTH } from './world/Chunk';
 import { BlockId } from './world/Block';
 import { VRSupport } from './vr/VRSupport';
+import { XRGui } from './vr/XRGui';
+import { CraftingSystem, Tool, ToolType, Material } from './crafting/CraftingSystem';
+import { CraftingUI } from './ui/CraftingUI';
+
+interface Chicken {
+  mesh: Mesh;
+  position: Vector3;
+  velocity: Vector3;
+  state: 'walking' | 'pecking' | 'pausing';
+  stateTimer: number;
+  targetDirection: number;
+}
+
+interface Villager {
+  headMesh: Mesh;
+  bodyMesh: Mesh;
+  noseMesh: Mesh;
+  position: Vector3;
+  velocity: Vector3;
+  state: 'idle' | 'walking' | 'talking';
+  stateTimer: number;
+  targetDirection: number;
+}
 
 class SimpleGame {
   private engine: Engine;
@@ -45,12 +68,21 @@ class SimpleGame {
   // Tools and inventory
   private blockInventory: Map<BlockId, number> = new Map();
   private inventoryPanel: StackPanel | null = null;
+  private craftingUI: CraftingUI | null = null;
   private inventoryVisible: boolean = false;
   
   // Mining - currently instant, no progress tracking needed
   
   // VR Support
   private vrSupport?: VRSupport;
+  private xrGui?: XRGui;
+  
+  // Crafting and tools
+  private craftingSystem: CraftingSystem;
+  private currentTool: Tool;
+  private tools: (Tool | null)[] = new Array(9).fill(null);
+  private craftingGrid: (BlockId | null)[][] = Array(3).fill(null).map(() => Array(3).fill(null));
+  private isCraftingOpen: boolean = false;
   
   // Textures
   private useTextures: boolean = false; // Off by default for performance
@@ -64,6 +96,22 @@ class SimpleGame {
   
   // Shared materials to prevent memory issues
   private blockMaterials: Map<string, StandardMaterial> = new Map();
+  
+  // Chicken-related properties
+  private chickens: Chicken[] = [];
+  private chickensEnabled: boolean = false;
+  private chickenTexture?: Texture;
+  private chickenMaterial?: StandardMaterial;
+  private maxChickens: number = 10;
+  
+  // Villager-related properties
+  private villagers: Villager[] = [];
+  private villagersEnabled: boolean = false;
+  private villagerFaceTexture?: Texture;
+  private villagerBodyTexture?: Texture;
+  private villagerSideTexture?: Texture;
+  private peopleDensity: number = 0; // Default density per world
+  private maxVillagers: number = 15;
   
   private getOrCreateBlockMaterial(blockId: BlockId): StandardMaterial {
     // Create a material key based on block type and texture state
@@ -108,6 +156,14 @@ class SimpleGame {
         case BlockId.BRICK:
           material.diffuseColor = new Color3(0.5, 0.5, 0.5);
           break;
+        case BlockId.LAVA:
+          material.diffuseColor = new Color3(1, 0.3, 0);
+          material.emissiveColor = new Color3(1, 0.5, 0);
+          material.specularColor = new Color3(0, 0, 0);
+          break;
+        case BlockId.BEDROCK:
+          material.diffuseColor = new Color3(0.2, 0.2, 0.2);
+          break;
         default:
           material.diffuseColor = new Color3(0.8, 0.8, 0.8);
       }
@@ -126,6 +182,10 @@ class SimpleGame {
   
   constructor(canvas: HTMLCanvasElement) {
     console.log('Initializing game...');
+    
+    // Initialize crafting system
+    this.craftingSystem = new CraftingSystem();
+    this.currentTool = this.craftingSystem.createTool(ToolType.FIST);
     
     // Initialize inventory
     this.blockInventory.set(BlockId.GRASS, 0);
@@ -151,6 +211,12 @@ class SimpleGame {
     // Initialize VR support
     this.initializeVR();
     
+    // Initialize chicken texture
+    this.initializeChickenTexture();
+    
+    // Initialize villager textures
+    this.initializeVillagerTextures();
+    
     // Start game loop
     this.startGameLoop();
     
@@ -175,7 +241,7 @@ class SimpleGame {
     
     // Remove chunks that are too far away
     const maxDistance = 3;
-    this.chunks.forEach((chunk, key) => {
+    this.chunks.forEach((_, key) => {
       const [cx, , cz] = key.split('_').map(Number);
       const distance = Math.max(
         Math.abs(cx - playerChunkX),
@@ -246,6 +312,16 @@ class SimpleGame {
             }
             break;
             
+          case 'lava':
+            // Lava world: rough terrain with lots of lava pockets
+            height = 6 + noise(worldX * 0.04, worldZ * 0.04) * 8;
+            height += noise(worldX * 0.08, worldZ * 0.08) * 4;
+            // Create lava lakes at surface
+            if (noise(worldX * 0.02, worldZ * 0.02) < -0.3) {
+              height = 3; // Low areas for lava lakes
+            }
+            break;
+            
           default:
             // Default terrain generation
             height += noise(worldX * this.terrainScale * 0.5, worldZ * this.terrainScale * 0.5) * this.mountainHeight;
@@ -256,12 +332,40 @@ class SimpleGame {
         // Ensure minimum height and convert to integer
         height = Math.max(2, Math.floor(height));
         
+        // Add bedrock at bottom
+        chunk.setBlockId(x, 0, z, BlockId.BEDROCK);
+        
         // Fill terrain with appropriate blocks
-        for (let y = 0; y < Math.min(height, CHUNK_HEIGHT - 1); y++) {
+        for (let y = 1; y < Math.min(height, CHUNK_HEIGHT - 1); y++) {
           let blockType = BlockId.BRICK;
           
+          // Add lava at very deep levels (below y=3) for all worlds
+          if (y <= 2 && this.worldType !== 'lava') {
+            // Random lava pockets underground
+            if (noise(worldX * 0.1, worldZ * 0.1 + y * 100) > 0.6) {
+              blockType = BlockId.LAVA;
+            } else {
+              blockType = BlockId.BRICK;
+            }
+          }
+          // Lava world special handling
+          else if (this.worldType === 'lava') {
+            if (y <= 3 && height <= 3) {
+              // Surface lava lakes
+              blockType = BlockId.LAVA;
+            } else if (y < 2) {
+              // Underground lava is common
+              blockType = noise(worldX * 0.15, worldZ * 0.15) > 0.3 ? BlockId.LAVA : BlockId.BRICK;
+            } else if (y < height - 1) {
+              // Blackened stone
+              blockType = BlockId.BRICK;
+            } else {
+              // Charred surface
+              blockType = BlockId.BRICK;
+            }
+          }
           // Choose block type based on world type
-          if (this.worldType === 'desert') {
+          else if (this.worldType === 'desert') {
             // Desert uses sand-colored "wood" blocks
             blockType = BlockId.WOOD;
           } else if (this.worldType === 'island' && height <= this.waterLevel + 2) {
@@ -299,6 +403,14 @@ class SimpleGame {
     // Set up VR callbacks for mining and placing
     this.vrSupport.setMiningCallback((position: Vector3) => {
       this.mineBlock(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z));
+    });
+    
+    this.vrSupport.setPlacingCallback((position: Vector3) => {
+      // Place selected block type based on current tool slot
+      const blockType = this.selectedTool < 3 ? 
+        [BlockId.GRASS, BlockId.WOOD, BlockId.BRICK][this.selectedTool] : 
+        BlockId.GRASS;
+      this.placeBlock(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z), blockType);
     });
     
     // Add VR button to UI
@@ -339,6 +451,31 @@ class SimpleGame {
     
     // Clear existing world
     this.clearWorld();
+    
+    // Update sky and fog colors based on world type
+    if (this.worldType === 'lava') {
+      // Red/orange sky for lava world
+      this.scene.clearColor = new Color3(0.8, 0.3, 0.1).toColor4();
+      this.scene.fogColor = new Color3(0.9, 0.4, 0.2);
+      const light = this.scene.getLightByName('light') as HemisphericLight;
+      if (light) {
+        light.groundColor = new Color3(0.4, 0.1, 0.1);
+        light.diffuse = new Color3(1, 0.6, 0.4);
+      }
+    } else if (this.worldType === 'desert') {
+      // Sandy yellow sky for desert
+      this.scene.clearColor = new Color3(0.9, 0.8, 0.6).toColor4();
+      this.scene.fogColor = new Color3(0.9, 0.85, 0.7);
+    } else {
+      // Default blue sky
+      this.scene.clearColor = new Color3(0.5, 0.7, 1).toColor4();
+      this.scene.fogColor = new Color3(0.7, 0.8, 0.9);
+      const light = this.scene.getLightByName('light') as HemisphericLight;
+      if (light) {
+        light.groundColor = new Color3(0.2, 0.2, 0.3);
+        light.diffuse = new Color3(1, 1, 1);
+      }
+    }
     
     // Create noise function for terrain
     const noise = createNoise2D(() => this.worldSeed);
@@ -656,96 +793,6 @@ class SimpleGame {
       this.textureProgressBar = undefined;
     }
     this.textureProgress.clear();
-  }
-  
-  // Legacy synchronous texture creation methods (kept for fallback)
-  private createBlockTextures(): void {
-    // Create grass texture
-    this.grassTexture = this.createGrassTexture();
-    
-    // Create dirt texture
-    this.dirtTexture = this.createDirtTexture();
-    
-    // Create rock texture
-    this.rockTexture = this.createRockTexture();
-  }
-  
-  private createGrassTexture(): Texture {
-    const size = 64;
-    const texture = new DynamicTexture("grassTexture", size, this.scene);
-    const context = texture.getContext();
-    
-    // Base green color
-    context.fillStyle = '#4a7c59';
-    context.fillRect(0, 0, size, size);
-    
-    // Add just a few grass variations for texture
-    for (let i = 0; i < 20; i++) {
-      const x = Math.floor(Math.random() * size);
-      const y = Math.floor(Math.random() * size);
-      const brightness = 80 + Math.random() * 40;
-      context.fillStyle = `rgb(${Math.floor(brightness * 0.4)}, ${Math.floor(brightness)}, ${Math.floor(brightness * 0.3)})`;
-      context.fillRect(x, y, 3, 3);
-    }
-    
-    texture.update();
-    return texture;
-  }
-  
-  private createDirtTexture(): Texture {
-    const size = 64;
-    const texture = new DynamicTexture("dirtTexture", size, this.scene);
-    const context = texture.getContext();
-    
-    // Base brown color
-    context.fillStyle = '#8b6239';
-    context.fillRect(0, 0, size, size);
-    
-    // Add just a few dirt spots
-    for (let i = 0; i < 25; i++) {
-      const x = Math.floor(Math.random() * size);
-      const y = Math.floor(Math.random() * size);
-      const variation = Math.random() * 30 - 15;
-      const r = Math.floor(Math.max(0, Math.min(255, 139 + variation)));
-      const g = Math.floor(Math.max(0, Math.min(255, 98 + variation)));
-      const b = Math.floor(Math.max(0, Math.min(255, 57 + variation)));
-      context.fillStyle = `rgb(${r}, ${g}, ${b})`;
-      context.fillRect(x, y, 3, 3);
-    }
-    
-    texture.update();
-    return texture;
-  }
-  
-  private createRockTexture(): Texture {
-    const size = 64;
-    const texture = new DynamicTexture("rockTexture", size, this.scene);
-    const context = texture.getContext();
-    
-    // Base gray color
-    context.fillStyle = '#808080';
-    context.fillRect(0, 0, size, size);
-    
-    // Add just a few rock variations
-    for (let i = 0; i < 30; i++) {
-      const x = Math.floor(Math.random() * size);
-      const y = Math.floor(Math.random() * size);
-      const variation = Math.random() * 60 - 30;
-      const gray = Math.floor(Math.max(0, Math.min(255, 128 + variation)));
-      context.fillStyle = `rgb(${gray}, ${gray}, ${gray})`;
-      context.fillRect(x, y, 4, 4);
-    }
-    
-    // A few dark spots
-    for (let i = 0; i < 5; i++) {
-      const x = Math.floor(Math.random() * size);
-      const y = Math.floor(Math.random() * size);
-      context.fillStyle = '#404040';
-      context.fillRect(x, y, 2, 2);
-    }
-    
-    texture.update();
-    return texture;
   }
   
   private createLeafTexture(): Texture {
@@ -1122,6 +1169,33 @@ class SimpleGame {
     }
   }
   
+  private isPositionInGeneratedChunk(x: number, z: number): boolean {
+    const chunkX = Math.floor(x / CHUNK_WIDTH);
+    const chunkZ = Math.floor(z / CHUNK_DEPTH);
+    const key = `${chunkX}_0_${chunkZ}`;
+    return this.chunks.has(key);
+  }
+  
+  private getGeneratedChunkBounds(): { minX: number, maxX: number, minZ: number, maxZ: number } {
+    let minX = Infinity, maxX = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+    
+    this.chunks.forEach((_, key) => {
+      const [cx, , cz] = key.split('_').map(Number);
+      const chunkMinX = cx * CHUNK_WIDTH;
+      const chunkMaxX = (cx + 1) * CHUNK_WIDTH;
+      const chunkMinZ = cz * CHUNK_DEPTH;
+      const chunkMaxZ = (cz + 1) * CHUNK_DEPTH;
+      
+      minX = Math.min(minX, chunkMinX);
+      maxX = Math.max(maxX, chunkMaxX);
+      minZ = Math.min(minZ, chunkMinZ);
+      maxZ = Math.max(maxZ, chunkMaxZ);
+    });
+    
+    return { minX, maxX, minZ, maxZ };
+  }
+  
   private getHeightAt(worldX: number, worldZ: number): number {
     // Sample height from the generated terrain
     const x = Math.floor(worldX);
@@ -1200,7 +1274,7 @@ class SimpleGame {
           !mesh.name.includes('camera') && 
           !mesh.name.includes('crosshair') &&
           !mesh.name.includes('skybox')) {
-        meshesToDispose.push(mesh);
+        meshesToDispose.push(mesh as Mesh);
       }
     });
     
@@ -1277,7 +1351,7 @@ class SimpleGame {
     
     // Add top instruction bar
     const instructionText = new TextBlock();
-    instructionText.text = "WASD: Move | Shift: Run | Space: Jump | Click/X: Mine | I: Inventory | T: Textures | G: Gen World | VR";
+    instructionText.text = "WASD: Move | Shift: Run | Space: Jump | Click/X: Mine | I: Inventory | K: Crafting | T: Textures | G: Gen World | VR";
     instructionText.color = "white";
     instructionText.fontSize = 14;
     instructionText.height = "25px";
@@ -1330,7 +1404,8 @@ class SimpleGame {
       { name: "Desert", mountain: 5, rough: 0.2, scale: 0.08, type: 'desert', water: -10 },
       { name: "Island", mountain: 8, rough: 0.4, scale: 0.04, type: 'island', water: 3 },
       { name: "Mountains", mountain: 25, rough: 0.8, scale: 0.02, type: 'mountains', water: 0 },
-      { name: "Village", mountain: 8, rough: 0.3, scale: 0.06, type: 'village', water: 0 }
+      { name: "Village", mountain: 8, rough: 0.3, scale: 0.06, type: 'village', water: 0 },
+      { name: "Lava", mountain: 10, rough: 0.6, scale: 0.05, type: 'lava', water: -10 }
     ];
     
     const presetButtons = new StackPanel();
@@ -1353,6 +1428,14 @@ class SimpleGame {
         this.worldType = preset.type;
         this.waterLevel = preset.water;
         this.worldSeed = Date.now();
+        
+        // Set people density based on world type
+        if (preset.type === 'village') {
+          this.peopleDensity = 8; // Higher density for village world
+        } else {
+          this.peopleDensity = 0; // No villagers in other worlds by default
+        }
+        
         this.createWorld();
         // Update slider values
         mountainSlider.value = preset.mountain;
@@ -1457,6 +1540,9 @@ class SimpleGame {
     
     // Create inventory panel
     this.createInventoryPanel();
+    
+    // Create crafting UI
+    this.craftingUI = new CraftingUI(this.scene, this.advancedTexture);
   }
   
   private createInventoryPanel(): void {
@@ -1691,6 +1777,24 @@ class SimpleGame {
         this.toggleTextures();
       }
       
+      // Toggle crafting UI with K key
+      if (e.code === 'KeyK') {
+        if (this.craftingUI) {
+          this.craftingUI.toggle();
+          this.isGuiActive = this.craftingUI.getIsVisible();
+        }
+      }
+      
+      // Toggle chickens with C key
+      if (e.code === 'KeyC') {
+        this.toggleChickens();
+      }
+      
+      // Toggle villagers with V key
+      if (e.code === 'KeyV') {
+        this.toggleVillagers();
+      }
+      
       // Toggle automatic world generation with G key
       if (e.code === 'KeyG') {
         this.autoGenerateChunks = !this.autoGenerateChunks;
@@ -1866,6 +1970,53 @@ class SimpleGame {
   }
   
   private startMining(): void {
+    // First check for tree meshes
+    const ray = new Ray(this.camera.position, this.camera.getForwardRay().direction, 5);
+    const pickInfo = this.scene.pickWithRay(ray);
+    
+    if (pickInfo && pickInfo.hit && pickInfo.pickedMesh) {
+      // Check if we hit a tree trunk
+      if (pickInfo.pickedMesh.name.includes('trunk')) {
+        // Give wood blocks when mining trees
+        const woodCount = 3 + Math.floor(Math.random() * 3); // 3-5 wood blocks
+        const currentCount = this.blockInventory.get(BlockId.WOOD) || 0;
+        this.blockInventory.set(BlockId.WOOD, currentCount + woodCount);
+        
+        // Update inventory display if visible
+        if (this.inventoryVisible) {
+          this.updateInventoryDisplay();
+        }
+        
+        // Remove the tree
+        const treeMeshes = this.trees.filter(tree => 
+          tree.name === pickInfo.pickedMesh!.name || 
+          tree.name.replace('trunk', 'leaves') === pickInfo.pickedMesh!.name.replace('trunk', 'leaves')
+        );
+        
+        treeMeshes.forEach(mesh => {
+          mesh.dispose();
+          const index = this.trees.indexOf(mesh);
+          if (index > -1) {
+            this.trees.splice(index, 1);
+          }
+        });
+        
+        // Also remove associated leaves
+        const leavesName = pickInfo.pickedMesh.name.replace('trunk', 'leaves');
+        const leavesMesh = this.trees.find(tree => tree.name === leavesName);
+        if (leavesMesh) {
+          leavesMesh.dispose();
+          const index = this.trees.indexOf(leavesMesh);
+          if (index > -1) {
+            this.trees.splice(index, 1);
+          }
+        }
+        
+        return;
+      }
+    }
+    
+    // Otherwise check for regular blocks
     const hit = this.raycast();
     if (hit) {
       // Mine instantly
@@ -1900,6 +2051,91 @@ class SimpleGame {
     return null;
   }
   
+  private createMiningEffect(x: number, y: number, z: number): void {
+    // Create a simple particle effect for mining
+    const particleCount = 8;
+    const particles: Mesh[] = [];
+    
+    for (let i = 0; i < particleCount; i++) {
+      const particle = MeshBuilder.CreateBox(`particle_${x}_${y}_${z}_${i}`, { size: 0.1 }, this.scene);
+      particle.position = new Vector3(x + 0.5, y + 0.5, z + 0.5);
+      
+      // Set particle material
+      const mat = new StandardMaterial(`particleMat_${i}`, this.scene);
+      mat.diffuseColor = new Color3(0.6, 0.6, 0.6);
+      mat.emissiveColor = new Color3(0.2, 0.2, 0.2);
+      particle.material = mat;
+      
+      particles.push(particle);
+      
+      // Random velocity
+      const velocity = new Vector3(
+        (Math.random() - 0.5) * 0.3,
+        Math.random() * 0.3 + 0.1,
+        (Math.random() - 0.5) * 0.3
+      );
+      
+      // Animate particle
+      let lifetime = 0;
+      const animation = this.scene.registerBeforeRender(() => {
+        lifetime += 0.016; // Approximate 60fps
+        
+        if (lifetime > 0.5) {
+          // Clean up after 0.5 seconds
+          this.scene.unregisterBeforeRender(animation);
+          particle.material?.dispose();
+          particle.dispose();
+          return;
+        }
+        
+        // Apply physics
+        velocity.y -= 0.5 * 0.016; // Gravity
+        particle.position.addInPlace(velocity.scale(0.016 * 10));
+        
+        // Fade out
+        particle.scaling = Vector3.One().scale(1 - lifetime * 2);
+      });
+    }
+  }
+  
+  private placeBlock(x: number, y: number, z: number, blockType: BlockId): void {
+    // Check if we have the block in inventory
+    const count = this.blockInventory.get(blockType) || 0;
+    if (count <= 0) return;
+    
+    // Calculate chunk coordinates
+    const chunkX = Math.floor(x / CHUNK_WIDTH);
+    const chunkZ = Math.floor(z / CHUNK_DEPTH);
+    const key = `${chunkX}_0_${chunkZ}`;
+    const chunk = this.chunks.get(key);
+    
+    if (chunk) {
+      const localX = ((x % CHUNK_WIDTH) + CHUNK_WIDTH) % CHUNK_WIDTH;
+      const localZ = ((z % CHUNK_DEPTH) + CHUNK_DEPTH) % CHUNK_DEPTH;
+      
+      // Check if position is empty
+      const currentBlock = chunk.getBlockId(Math.floor(localX), y, Math.floor(localZ));
+      if (currentBlock === BlockId.AIR) {
+        // Place block
+        chunk.setBlockId(Math.floor(localX), y, Math.floor(localZ), blockType);
+        
+        // Remove from inventory
+        this.blockInventory.set(blockType, count - 1);
+        this.updateInventoryDisplay();
+        
+        // Create mesh for the new block
+        const box = MeshBuilder.CreateBox(`block_${x}_${y}_${z}`, { size: 1 }, this.scene);
+        box.position = new Vector3(x + 0.5, y + 0.5, z + 0.5);
+        box.material = this.getOrCreateBlockMaterial(blockType);
+        
+        // Add to chunk meshes
+        const chunkMeshes = this.chunkMeshes.get(key) || [];
+        chunkMeshes.push(box);
+        this.chunkMeshes.set(key, chunkMeshes);
+      }
+    }
+  }
+  
   private mineBlock(x: number, y: number, z: number): void {
     // Remove block from chunk
     const chunkX = Math.floor(x / CHUNK_WIDTH);
@@ -1921,6 +2157,9 @@ class SimpleGame {
         
         // Remove block
         chunk.setBlockId(Math.floor(localX), y, Math.floor(localZ), BlockId.AIR);
+        
+        // Create puff of smoke effect
+        this.createMiningEffect(x, y, z);
         
         // Performance optimization: Only update affected blocks
         // 1. Remove the mined block mesh
@@ -2016,6 +2255,16 @@ class SimpleGame {
         this.loadChunksAroundPlayer();
       }
       
+      // Update chickens
+      if (this.chickensEnabled && this.chickens.length > 0) {
+        this.updateChickens(deltaTime);
+      }
+      
+      // Update villagers
+      if (this.villagersEnabled && this.villagers.length > 0) {
+        this.updateVillagers(deltaTime);
+      }
+      
       // Update crosshair targeting
       this.raycast();
       
@@ -2095,6 +2344,518 @@ class SimpleGame {
     if (loadingScreen) {
       loadingScreen.style.display = 'none';
       console.log('Game started! Use WASD to move, Shift to run, Space to jump, Arrow keys to turn, Click to capture mouse');
+    }
+  }
+  
+  // Chicken-related methods
+  private initializeChickenTexture(): void {
+    try {
+      // Load the chicken texture
+      this.chickenTexture = new Texture('/src/assets/chicken_32.png', this.scene);
+      this.chickenTexture.hasAlpha = true;
+      
+      console.log('Chicken texture loaded');
+    } catch (error) {
+      console.error('Failed to load chicken texture:', error);
+    }
+  }
+  
+  private toggleChickens(): void {
+    this.chickensEnabled = !this.chickensEnabled;
+    
+    if (this.chickensEnabled) {
+      this.spawnChickens();
+      console.log('Chickens enabled');
+    } else {
+      this.removeAllChickens();
+      console.log('Chickens disabled');
+    }
+  }
+  
+  private spawnChickens(): void {
+    // Remove existing chickens first
+    this.removeAllChickens();
+    
+    // Get bounds of generated chunks
+    const bounds = this.getGeneratedChunkBounds();
+    const playerPos = this.camera.position;
+    
+    let attempts = 0;
+    const maxAttempts = this.maxChickens * 3; // Allow multiple attempts to find valid positions
+    
+    for (let i = 0; i < this.maxChickens && attempts < maxAttempts; i++) {
+      attempts++;
+      
+      // Random position around player but within chunk bounds
+      const angle = Math.random() * Math.PI * 2;
+      const distance = 5 + Math.random() * 15;
+      let x = playerPos.x + Math.cos(angle) * distance;
+      let z = playerPos.z + Math.sin(angle) * distance;
+      
+      // Clamp to generated chunk bounds with margin
+      x = Math.max(bounds.minX + 2, Math.min(bounds.maxX - 2, x));
+      z = Math.max(bounds.minZ + 2, Math.min(bounds.maxZ - 2, z));
+      
+      // Check if position is in a generated chunk
+      if (!this.isPositionInGeneratedChunk(x, z)) {
+        i--; // Try again
+        continue;
+      }
+      
+      const y = this.getHeightAt(x, z) + 0.5;
+      
+      // Skip if in water or too high
+      if (y <= this.waterLevel || y > 30) {
+        i--; // Try again
+        continue;
+      }
+      
+      // Create chicken mesh with separate faces
+      const chickenMesh = MeshBuilder.CreateBox(`chicken_${i}`, { 
+        size: 0.8,
+        faceUV: [
+          new Vector4(0, 0, 1, 1), // Front face
+          new Vector4(0, 0, 0, 0), // Back face (no texture)
+          new Vector4(0, 0, 0, 0), // Right face (no texture)
+          new Vector4(0, 0, 0, 0), // Left face (no texture)
+          new Vector4(0, 0, 0, 0), // Top face (no texture)
+          new Vector4(0, 0, 0, 0)  // Bottom face (no texture)
+        ]
+      }, this.scene);
+      chickenMesh.position = new Vector3(x, y, z);
+      
+      // Create multi-material for chicken
+      const multiMat = new MultiMaterial(`chickenMultiMat_${i}`, this.scene);
+      
+      // Face material (with texture)
+      const faceMat = new StandardMaterial(`chickenFaceMat_${i}`, this.scene);
+      if (this.chickenTexture) {
+        faceMat.diffuseTexture = this.chickenTexture;
+        // Flip texture vertically
+        faceMat.diffuseTexture.vScale = -1;
+        faceMat.emissiveColor = new Color3(0.1, 0.1, 0.1);
+      } else {
+        faceMat.diffuseColor = new Color3(1, 0.8, 0.2);
+      }
+      
+      // Body material (solid color)
+      const bodyMat = new StandardMaterial(`chickenBodyMat_${i}`, this.scene);
+      bodyMat.diffuseColor = new Color3(1, 0.9, 0.3); // Yellow body
+      
+      // Assign materials to faces
+      multiMat.subMaterials = [
+        faceMat,  // Front face (0)
+        bodyMat,  // Back face (1)
+        bodyMat,  // Right face (2)
+        bodyMat,  // Left face (3)
+        bodyMat,  // Top face (4)
+        bodyMat   // Bottom face (5)
+      ];
+      
+      chickenMesh.material = multiMat;
+      chickenMesh.subMeshes = [];
+      chickenMesh.subMeshes.push(new SubMesh(0, 0, 4, 0, 6, chickenMesh)); // Front face
+      chickenMesh.subMeshes.push(new SubMesh(1, 4, 4, 6, 6, chickenMesh)); // Back face
+      chickenMesh.subMeshes.push(new SubMesh(2, 8, 4, 12, 6, chickenMesh)); // Right face
+      chickenMesh.subMeshes.push(new SubMesh(3, 12, 4, 18, 6, chickenMesh)); // Left face
+      chickenMesh.subMeshes.push(new SubMesh(4, 16, 4, 24, 6, chickenMesh)); // Top face
+      chickenMesh.subMeshes.push(new SubMesh(5, 20, 4, 30, 6, chickenMesh)); // Bottom face
+      
+      // Create chicken object
+      const chicken: Chicken = {
+        mesh: chickenMesh,
+        position: new Vector3(x, y, z),
+        velocity: Vector3.Zero(),
+        state: 'pausing',
+        stateTimer: Math.random() * 2,
+        targetDirection: Math.random() * Math.PI * 2
+      };
+      
+      this.chickens.push(chicken);
+    }
+  }
+  
+  private removeAllChickens(): void {
+    for (const chicken of this.chickens) {
+      chicken.mesh.dispose();
+    }
+    this.chickens = [];
+  }
+  
+  private updateChickens(deltaTime: number): void {
+    for (const chicken of this.chickens) {
+      // Update state timer
+      chicken.stateTimer -= deltaTime;
+      
+      // State machine
+      switch (chicken.state) {
+        case 'pausing':
+          if (chicken.stateTimer <= 0) {
+            // Transition to walking or pecking
+            if (Math.random() < 0.7) {
+              chicken.state = 'walking';
+              chicken.targetDirection = Math.random() * Math.PI * 2;
+              chicken.stateTimer = 1 + Math.random() * 2;
+            } else {
+              chicken.state = 'pecking';
+              chicken.stateTimer = 0.5 + Math.random() * 0.5;
+            }
+          }
+          break;
+          
+        case 'walking':
+          // Move in target direction
+          const speed = 1.5;
+          chicken.velocity.x = Math.cos(chicken.targetDirection) * speed;
+          chicken.velocity.z = Math.sin(chicken.targetDirection) * speed;
+          
+          // Update position
+          chicken.position.x += chicken.velocity.x * deltaTime;
+          chicken.position.z += chicken.velocity.z * deltaTime;
+          
+          // Keep on ground
+          const groundY = this.getHeightAt(chicken.position.x, chicken.position.z);
+          chicken.position.y = groundY + 0.5;
+          
+          // Face movement direction
+          chicken.mesh.rotation.y = chicken.targetDirection;
+          
+          // Transition to pause
+          if (chicken.stateTimer <= 0) {
+            chicken.state = 'pausing';
+            chicken.stateTimer = 1 + Math.random() * 2;
+            chicken.velocity = Vector3.Zero();
+          }
+          break;
+          
+        case 'pecking':
+          // Pecking animation (tilt forward)
+          const peckPhase = Math.sin(chicken.stateTimer * 10);
+          chicken.mesh.rotation.x = Math.abs(peckPhase) * 0.3;
+          
+          // Transition to pause
+          if (chicken.stateTimer <= 0) {
+            chicken.mesh.rotation.x = 0;
+            chicken.state = 'pausing';
+            chicken.stateTimer = 0.5 + Math.random() * 1;
+          }
+          break;
+      }
+      
+      // Update mesh position
+      chicken.mesh.position.copyFrom(chicken.position);
+      
+      // Small bobbing animation while walking
+      if (chicken.state === 'walking') {
+        chicken.mesh.position.y += Math.sin(performance.now() * 0.01 + chicken.mesh.id.charCodeAt(0)) * 0.05;
+      }
+    }
+  }
+  
+  // Villager-related methods
+  private initializeVillagerTextures(): void {
+    try {
+      // Import and create villager textures
+      import('./utils/createVillagerTextures').then(module => {
+        const faceDataUrl = module.createVillagerFaceTexture();
+        const bodyDataUrl = module.createVillagerBodyTexture();
+        const sideDataUrl = module.createVillagerSideTexture();
+        
+        this.villagerFaceTexture = new Texture(faceDataUrl, this.scene);
+        this.villagerBodyTexture = new Texture(bodyDataUrl, this.scene);
+        this.villagerSideTexture = new Texture(sideDataUrl, this.scene);
+        
+        console.log('Villager textures created');
+      });
+    } catch (error) {
+      console.error('Failed to create villager textures:', error);
+    }
+  }
+  
+  private toggleVillagers(): void {
+    this.villagersEnabled = !this.villagersEnabled;
+    
+    if (this.villagersEnabled) {
+      // Use world's people density if set, otherwise use a default of 5
+      const numVillagers = this.peopleDensity > 0 ? 
+        Math.floor(this.peopleDensity) : 
+        5; // Default to 5 villagers if density is 0
+      this.spawnVillagers(numVillagers);
+      console.log(`Villagers enabled (spawning ${numVillagers})`);
+    } else {
+      this.removeAllVillagers();
+      console.log('Villagers disabled');
+    }
+  }
+  
+  private spawnVillagers(count: number): void {
+    // Remove existing villagers first
+    this.removeAllVillagers();
+    
+    // Get bounds of generated chunks
+    const bounds = this.getGeneratedChunkBounds();
+    const playerPos = this.camera.position;
+    
+    let attempts = 0;
+    const maxAttempts = count * 3; // Allow multiple attempts to find valid positions
+    
+    for (let i = 0; i < Math.min(count, this.maxVillagers) && attempts < maxAttempts; i++) {
+      attempts++;
+      
+      // Random position around player but within chunk bounds
+      const angle = Math.random() * Math.PI * 2;
+      const distance = 10 + Math.random() * 20;
+      let x = playerPos.x + Math.cos(angle) * distance;
+      let z = playerPos.z + Math.sin(angle) * distance;
+      
+      // Clamp to generated chunk bounds with margin
+      x = Math.max(bounds.minX + 2, Math.min(bounds.maxX - 2, x));
+      z = Math.max(bounds.minZ + 2, Math.min(bounds.maxZ - 2, z));
+      
+      // Check if position is in a generated chunk
+      if (!this.isPositionInGeneratedChunk(x, z)) {
+        i--; // Try again
+        continue;
+      }
+      
+      const y = this.getHeightAt(x, z);
+      
+      // Skip if in water or too high
+      if (y <= this.waterLevel || y > 30) {
+        i--; // Try again
+        continue;
+      }
+      
+      // Create villager body (lower block)
+      const bodyMesh = MeshBuilder.CreateBox(`villager_body_${i}`, { 
+        width: 0.6,
+        height: 1,
+        depth: 0.4
+      }, this.scene);
+      bodyMesh.position = new Vector3(x, y + 0.5, z);
+      
+      // Apply body texture with multi-material
+      const bodyMultiMat = new MultiMaterial(`villagerBodyMultiMat_${i}`, this.scene);
+      
+      // Front material (with detailed texture)
+      const bodyFrontMat = new StandardMaterial(`villagerBodyFrontMat_${i}`, this.scene);
+      if (this.villagerBodyTexture) {
+        bodyFrontMat.diffuseTexture = this.villagerBodyTexture;
+        // Flip texture vertically for front
+        bodyFrontMat.diffuseTexture.vScale = -1;
+      } else {
+        bodyFrontMat.diffuseColor = new Color3(0.3, 0.5, 0.3); // Green tunic fallback
+      }
+      
+      // Back material (same texture but not flipped)
+      const bodyBackMat = new StandardMaterial(`villagerBodyBackMat_${i}`, this.scene);
+      if (this.villagerBodyTexture) {
+        bodyBackMat.diffuseTexture = this.villagerBodyTexture.clone();
+        // Don't flip for back - it's already correct orientation
+        bodyBackMat.diffuseTexture.vScale = 1;
+      } else {
+        bodyBackMat.diffuseColor = new Color3(0.3, 0.5, 0.3); // Green tunic fallback
+      }
+      
+      // Side material (simple shirt/pants)
+      const bodySideMat = new StandardMaterial(`villagerBodySideMat_${i}`, this.scene);
+      if (this.villagerSideTexture) {
+        bodySideMat.diffuseTexture = this.villagerSideTexture.clone();
+        // Rotate 90 degrees for sides
+        bodySideMat.diffuseTexture.uAng = Math.PI / 2;
+        bodySideMat.diffuseTexture.vScale = -1;
+      } else {
+        bodySideMat.diffuseColor = new Color3(0.35, 0.55, 0.35); // Slightly different green
+      }
+      
+      bodyMultiMat.subMaterials = [
+        bodyFrontMat,  // Front face
+        bodyBackMat,   // Back face (not flipped)
+        bodySideMat,   // Right face (rotated)
+        bodySideMat,   // Left face (rotated)
+        bodySideMat,   // Top face
+        bodySideMat    // Bottom face
+      ];
+      
+      bodyMesh.material = bodyMultiMat;
+      bodyMesh.subMeshes = [];
+      bodyMesh.subMeshes.push(new SubMesh(0, 0, 4, 0, 6, bodyMesh));
+      bodyMesh.subMeshes.push(new SubMesh(1, 4, 4, 6, 6, bodyMesh));
+      bodyMesh.subMeshes.push(new SubMesh(2, 8, 4, 12, 6, bodyMesh));
+      bodyMesh.subMeshes.push(new SubMesh(3, 12, 4, 18, 6, bodyMesh));
+      bodyMesh.subMeshes.push(new SubMesh(4, 16, 4, 24, 6, bodyMesh));
+      bodyMesh.subMeshes.push(new SubMesh(5, 20, 4, 30, 6, bodyMesh));
+      
+      // Create villager head (upper block)
+      const headMesh = MeshBuilder.CreateBox(`villager_head_${i}`, {
+        width: 0.5,
+        height: 0.5,
+        depth: 0.5
+      }, this.scene);
+      headMesh.position = new Vector3(x, y + 1.25, z);
+      
+      // Apply head texture to front face only
+      const headMultiMat = new MultiMaterial(`villagerHeadMultiMat_${i}`, this.scene);
+      
+      // Face material (with texture)
+      const faceMat = new StandardMaterial(`villagerFaceMat_${i}`, this.scene);
+      if (this.villagerFaceTexture) {
+        faceMat.diffuseTexture = this.villagerFaceTexture;
+        // Flip texture vertically
+        faceMat.diffuseTexture.vScale = -1;
+      } else {
+        faceMat.diffuseColor = new Color3(0.95, 0.75, 0.6); // Skin color fallback
+      }
+      
+      // Side/back material (hair color)
+      const hairMat = new StandardMaterial(`villagerHairMat_${i}`, this.scene);
+      hairMat.diffuseColor = new Color3(0.4, 0.2, 0.1); // Brown hair
+      
+      headMultiMat.subMaterials = [
+        faceMat,  // Front face
+        hairMat,  // Back face
+        hairMat,  // Right face
+        hairMat,  // Left face
+        hairMat,  // Top face
+        hairMat   // Bottom face
+      ];
+      
+      headMesh.material = headMultiMat;
+      headMesh.subMeshes = [];
+      headMesh.subMeshes.push(new SubMesh(0, 0, 4, 0, 6, headMesh));
+      headMesh.subMeshes.push(new SubMesh(1, 4, 4, 6, 6, headMesh));
+      headMesh.subMeshes.push(new SubMesh(2, 8, 4, 12, 6, headMesh));
+      headMesh.subMeshes.push(new SubMesh(3, 12, 4, 18, 6, headMesh));
+      headMesh.subMeshes.push(new SubMesh(4, 16, 4, 24, 6, headMesh));
+      headMesh.subMeshes.push(new SubMesh(5, 20, 4, 30, 6, headMesh));
+      
+      // Create nose (small cube protruding from face)
+      const noseMesh = MeshBuilder.CreateBox(`villager_nose_${i}`, {
+        width: 0.1,
+        height: 0.1,
+        depth: 0.15
+      }, this.scene);
+      // Position relative to parent (head), not absolute world position
+      // Front face is -Z in Babylon.js default box orientation
+      noseMesh.position = new Vector3(0, 0, 0.3); // Positioned in front of face (positive Z)
+      noseMesh.parent = headMesh;
+      
+      const noseMat = new StandardMaterial(`villagerNoseMat_${i}`, this.scene);
+      noseMat.diffuseColor = new Color3(0.9, 0.7, 0.55); // Slightly darker skin tone
+      noseMesh.material = noseMat;
+      
+      // Create villager object
+      const villager: Villager = {
+        headMesh,
+        bodyMesh,
+        noseMesh,
+        position: new Vector3(x, y, z),
+        velocity: Vector3.Zero(),
+        state: 'idle',
+        stateTimer: Math.random() * 3,
+        targetDirection: Math.random() * Math.PI * 2
+      };
+      
+      this.villagers.push(villager);
+    }
+  }
+  
+  private removeAllVillagers(): void {
+    for (const villager of this.villagers) {
+      villager.headMesh.dispose();
+      villager.bodyMesh.dispose();
+      villager.noseMesh.dispose();
+    }
+    this.villagers = [];
+  }
+  
+  private updateVillagers(deltaTime: number): void {
+    for (const villager of this.villagers) {
+      // Update state timer
+      villager.stateTimer -= deltaTime;
+      
+      // State machine
+      switch (villager.state) {
+        case 'idle':
+          // Small idle animation (subtle head movement)
+          villager.headMesh.rotation.y = Math.sin(performance.now() * 0.001) * 0.1;
+          
+          if (villager.stateTimer <= 0) {
+            // Transition to walking or talking
+            const rand = Math.random();
+            if (rand < 0.6) {
+              villager.state = 'walking';
+              villager.targetDirection = Math.random() * Math.PI * 2;
+              villager.stateTimer = 2 + Math.random() * 3;
+            } else {
+              villager.state = 'talking';
+              villager.stateTimer = 1 + Math.random() * 2;
+            }
+          }
+          break;
+          
+        case 'walking':
+          // Move in target direction (slower than chickens)
+          const speed = 1.0;
+          villager.velocity.x = Math.cos(villager.targetDirection) * speed;
+          villager.velocity.z = Math.sin(villager.targetDirection) * speed;
+          
+          // Update position
+          villager.position.x += villager.velocity.x * deltaTime;
+          villager.position.z += villager.velocity.z * deltaTime;
+          
+          // Keep on ground
+          const groundY = this.getHeightAt(villager.position.x, villager.position.z);
+          villager.position.y = groundY;
+          
+          // Face movement direction
+          const rotation = villager.targetDirection;
+          villager.headMesh.rotation.y = rotation;
+          villager.bodyMesh.rotation.y = rotation;
+          
+          // Walking animation (slight bobbing)
+          const bobAmount = Math.sin(performance.now() * 0.005) * 0.05;
+          villager.headMesh.position.x = villager.position.x;
+          villager.headMesh.position.y = villager.position.y + 1.25 + bobAmount;
+          villager.headMesh.position.z = villager.position.z;
+          villager.bodyMesh.position.x = villager.position.x;
+          villager.bodyMesh.position.y = villager.position.y + 0.5 + bobAmount;
+          villager.bodyMesh.position.z = villager.position.z;
+          
+          // Transition back to idle
+          if (villager.stateTimer <= 0) {
+            villager.state = 'idle';
+            villager.stateTimer = 2 + Math.random() * 3;
+            villager.velocity = Vector3.Zero();
+          }
+          break;
+          
+        case 'talking':
+          // Talking animation (head nodding)
+          const nodPhase = Math.sin(villager.stateTimer * 8);
+          villager.headMesh.rotation.x = Math.abs(nodPhase) * 0.15;
+          
+          // Transition back to idle
+          if (villager.stateTimer <= 0) {
+            villager.headMesh.rotation.x = 0;
+            villager.state = 'idle';
+            villager.stateTimer = 1 + Math.random() * 2;
+          }
+          break;
+      }
+      
+      // Update mesh positions
+      if (villager.state !== 'walking') {
+        villager.headMesh.position.x = villager.position.x;
+        villager.headMesh.position.z = villager.position.z;
+        villager.bodyMesh.position.x = villager.position.x;
+        villager.bodyMesh.position.z = villager.position.z;
+        
+        if (villager.state !== 'talking') {
+          villager.headMesh.position.y = villager.position.y + 1.25;
+        }
+        villager.bodyMesh.position.y = villager.position.y + 0.5;
+      }
     }
   }
 }
